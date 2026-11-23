@@ -7,6 +7,8 @@ import {
   type LookupOptions,
   type VerifiedAccount,
 } from './discordLookup.ts';
+import type {QuotaManager} from './quota.ts';
+import {hashOwnerKey} from './security.ts';
 
 interface TelegramUser {
   id: number;
@@ -102,6 +104,7 @@ function parseCsvTargets(rawText: string): string[] {
 export class TelegramBotRunner {
   private readonly botToken: string;
   private readonly jobManager: LookupJobManager;
+  private readonly quotaManager: QuotaManager;
   private readonly exportsDir: string;
   private readonly allowedUserIds: Set<number>;
   private readonly sessions = new Map<number, ChatSession>();
@@ -115,11 +118,13 @@ export class TelegramBotRunner {
   constructor(options: {
     botToken: string;
     jobManager: LookupJobManager;
+    quotaManager: QuotaManager;
     exportsDir: string;
     allowedUserIds?: number[];
   }) {
     this.botToken = options.botToken.trim();
     this.jobManager = options.jobManager;
+    this.quotaManager = options.quotaManager;
     this.exportsDir = options.exportsDir;
     this.allowedUserIds = new Set(options.allowedUserIds ?? []);
   }
@@ -218,6 +223,7 @@ export class TelegramBotRunner {
           {command: 'start', description: 'Show welcome guide and Mini App link'},
           {command: 'settoken', description: 'Set & verify your Discord token'},
           {command: 'lookup', description: 'Look up usernames, User IDs, or DM IDs'},
+          {command: 'quota', description: 'Check your 50/day free-tier lookup quota'},
           {command: 'pause', description: 'Pause the active lookup job'},
           {command: 'continue', description: 'Continue a paused lookup job'},
           {command: 'stop', description: 'Stop job and export CSV & JSON'},
@@ -303,11 +309,17 @@ export class TelegramBotRunner {
       `Processed: ${job.currentIndex} / ${job.total} (${pct}%)`,
       `Resolved: ${job.resolvedCount} | Failed: ${job.failedCount}`,
     ];
+    if (job.quotaNote) {
+      lines.push(job.quotaNote);
+    }
     if (job.currentTarget && job.status === 'running') {
       lines.push(`Current target: ${job.currentTarget}`);
     }
     if (job.rateLimitNote) {
       lines.push(job.rateLimitNote);
+    }
+    if (job.haltReason) {
+      lines.push(`Notice: ${job.haltReason}`);
     }
     return lines.join('\n');
   }
@@ -358,14 +370,23 @@ export class TelegramBotRunner {
     }
   }
 
-  private async sendWelcome(chatId: number): Promise<void> {
+  private getOwnerKey(chatId: number, userId?: number): {ownerKey: string; ownerHash: string} {
+    const ownerKey = `tg:${userId ?? chatId}`;
+    return {ownerKey, ownerHash: hashOwnerKey(ownerKey)};
+  }
+
+  private async sendWelcome(chatId: number, userId?: number): Promise<void> {
     const miniAppUrl = this.getMiniAppUrl();
+    const {ownerKey} = this.getOwnerKey(chatId, userId);
+    const quota = this.quotaManager.getQuota(ownerKey);
     const lines = [
       'LookupDesk Bot Ready',
+      `Free Tier Quota: ${quota.remaining}/${quota.limit} lookups remaining today`,
       '',
       'Commands:',
       '/settoken <TOKEN> — Verify and save your Discord token in session memory',
       '/lookup <targets> — Look up usernames, User IDs, or DM channel IDs',
+      '/quota — Check remaining daily free-tier lookups (50/day)',
       '/pause | /continue | /stop — Control an active batch lookup',
       '/clear — Remove your token from bot memory',
       '',
@@ -428,7 +449,11 @@ export class TelegramBotRunner {
     });
   }
 
-  private async startLookupForChat(chatId: number, targets: string[]): Promise<void> {
+  private async startLookupForChat(
+    chatId: number,
+    targets: string[],
+    userId?: number,
+  ): Promise<void> {
     const session = this.getOrCreateSession(chatId);
     if (!session.discordToken) {
       await this.tgApi('sendMessage', {
@@ -457,6 +482,7 @@ export class TelegramBotRunner {
       return;
     }
 
+    const {ownerKey, ownerHash} = this.getOwnerKey(chatId, userId);
     const options: LookupOptions = {
       fetchProfile: true,
       fetchSupplemental: true,
@@ -464,11 +490,27 @@ export class TelegramBotRunner {
       messageLimit: 10,
       withMutualGuilds: true,
       withMutualFriends: true,
-      delayMs: 1000,
-      label: `tg_${chatId}`,
+      delayMs: 1500,
+      label: `tg_${ownerHash.slice(0, 8)}`,
     };
 
-    const job = this.jobManager.startJob(session.discordToken, targets, options);
+    const started = this.jobManager.startJob(
+      ownerKey,
+      ownerHash,
+      session.discordToken,
+      targets,
+      options,
+    );
+
+    if (!started.ok) {
+      await this.tgApi('sendMessage', {
+        chat_id: chatId,
+        text: started.error,
+      });
+      return;
+    }
+
+    const job = started.job;
     session.activeJobId = job.id;
     this.jobOwners.set(job.id, chatId);
 
@@ -479,12 +521,14 @@ export class TelegramBotRunner {
     });
 
     const statusMsgId = sent.result?.message_id;
-    void this.monitorJobAndDeliverExports(chatId, job.id, statusMsgId);
+    void this.monitorJobAndDeliverExports(chatId, job.id, ownerKey, ownerHash, statusMsgId);
   }
 
   private async monitorJobAndDeliverExports(
     chatId: number,
     jobId: string,
+    ownerKey: string,
+    ownerHash: string,
     statusMsgId?: number,
   ): Promise<void> {
     let lastRender = '';
@@ -505,17 +549,19 @@ export class TelegramBotRunner {
       }
 
       if (job.status === 'completed' || job.status === 'stopped' || job.status === 'failed') {
-        if (job.savedFiles.csv && job.savedFiles.json) {
-          const csvPath = path.resolve(this.exportsDir, job.savedFiles.csv);
-          const jsonPath = path.resolve(this.exportsDir, job.savedFiles.json);
-          if (csvPath.startsWith(this.exportsDir + path.sep)) {
+        const ownerDir = path.resolve(this.exportsDir, ownerHash);
+        const quota = this.quotaManager.getQuota(ownerKey);
+        if (job.savedFiles.csv && job.savedFiles.json && ownerDir.startsWith(this.exportsDir + path.sep)) {
+          const csvPath = path.resolve(ownerDir, job.savedFiles.csv);
+          const jsonPath = path.resolve(ownerDir, job.savedFiles.json);
+          if (csvPath.startsWith(ownerDir + path.sep)) {
             await this.sendDocument(
               chatId,
               csvPath,
-              `CSV Export (${job.resolvedCount}/${job.total} resolved)`,
+              `CSV Export (${job.resolvedCount}/${job.total} resolved) · ${quota.remaining}/${quota.limit} daily lookups left`,
             ).catch(() => undefined);
           }
-          if (jsonPath.startsWith(this.exportsDir + path.sep)) {
+          if (jsonPath.startsWith(ownerDir + path.sep)) {
             await this.sendDocument(chatId, jsonPath, 'Full JSON Export').catch(() => undefined);
           }
         }
@@ -526,7 +572,11 @@ export class TelegramBotRunner {
     }
   }
 
-  private async handleDocumentUpload(chatId: number, doc: TelegramDocument): Promise<void> {
+  private async handleDocumentUpload(
+    chatId: number,
+    doc: TelegramDocument,
+    userId?: number,
+  ): Promise<void> {
     const filename = (doc.file_name || '').toLowerCase();
     if (!filename.endsWith('.txt') && !filename.endsWith('.csv')) {
       await this.tgApi('sendMessage', {
@@ -570,12 +620,13 @@ export class TelegramBotRunner {
       ? parseCsvTargets(content)
       : parseTargetsText(content);
 
-    await this.startLookupForChat(chatId, targets);
+    await this.startLookupForChat(chatId, targets, userId);
   }
 
   private async handleMessage(msg: TelegramMessage): Promise<void> {
     const chatId = msg.chat.id;
-    if (!this.isAuthorized(msg.from?.id)) {
+    const userId = msg.from?.id;
+    if (!this.isAuthorized(userId)) {
       await this.tgApi('sendMessage', {
         chat_id: chatId,
         text: 'Access restricted. Your Telegram user ID is not in TELEGRAM_ALLOWED_USER_IDS.',
@@ -587,7 +638,7 @@ export class TelegramBotRunner {
     const text = (msg.text || '').trim();
 
     if (msg.document) {
-      await this.handleDocumentUpload(chatId, msg.document);
+      await this.handleDocumentUpload(chatId, msg.document, userId);
       return;
     }
 
@@ -595,7 +646,21 @@ export class TelegramBotRunner {
 
     if (text.startsWith('/start') || text.startsWith('/help')) {
       session.awaitingToken = false;
-      await this.sendWelcome(chatId);
+      await this.sendWelcome(chatId, userId);
+      return;
+    }
+
+    if (text.startsWith('/quota')) {
+      const {ownerKey} = this.getOwnerKey(chatId, userId);
+      const q = this.quotaManager.getQuota(ownerKey);
+      await this.tgApi('sendMessage', {
+        chat_id: chatId,
+        text:
+          `Free Tier Daily Quota:\n` +
+          `Used today: ${q.used} / ${q.limit}\n` +
+          `Remaining: ${q.remaining}\n` +
+          `Resets at: 00:00 UTC`,
+      });
       return;
     }
 
@@ -654,7 +719,7 @@ export class TelegramBotRunner {
     if (text.startsWith('/lookup')) {
       const rawArgs = text.replace(/^\/lookup(@\w+)?/i, '').trim();
       const targets = parseTargetsText(rawArgs);
-      await this.startLookupForChat(chatId, targets);
+      await this.startLookupForChat(chatId, targets, userId);
       return;
     }
 
@@ -665,7 +730,7 @@ export class TelegramBotRunner {
 
     if (!text.startsWith('/')) {
       const targets = parseTargetsText(text);
-      await this.startLookupForChat(chatId, targets);
+      await this.startLookupForChat(chatId, targets, userId);
     }
   }
 }

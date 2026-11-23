@@ -6,6 +6,15 @@ export interface VerifiedAccount {
   avatar_url: string;
 }
 
+export interface QuotaSnapshot {
+  tier: 'free';
+  limit: number;
+  used: number;
+  remaining: number;
+  resetsAt: string;
+  dateUtc: string;
+}
+
 export interface LookupOptions {
   fetchProfile: boolean;
   fetchSupplemental: boolean;
@@ -61,6 +70,8 @@ export interface LookupJob {
   failedCount: number;
   currentTarget: string;
   rateLimitNote: string;
+  quotaNote?: string;
+  haltReason?: string;
   startedAt: string;
   finishedAt: string | null;
   options: LookupOptions;

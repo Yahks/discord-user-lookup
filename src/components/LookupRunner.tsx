@@ -16,13 +16,16 @@ import {
   Upload,
   X,
 } from 'lucide-react';
-import type {LookupJob, LookupResultEntry, VerifiedAccount} from '../types';
+import {apiFetch, downloadExportFile} from '../lib/api';
+import type {LookupJob, LookupResultEntry, QuotaSnapshot, VerifiedAccount} from '../types';
 
 interface LookupRunnerProps {
   token: string;
   onTokenChange: (token: string) => void;
   verifiedAccount: VerifiedAccount | null;
   onVerifiedAccountChange: (account: VerifiedAccount | null) => void;
+  quota: QuotaSnapshot | null;
+  onQuotaChange: (quota: QuotaSnapshot) => void;
   onOpenExport: (filename: string) => void;
   onExportsChanged: () => void;
 }
@@ -85,6 +88,8 @@ export function LookupRunner({
   onTokenChange,
   verifiedAccount,
   onVerifiedAccountChange,
+  quota,
+  onQuotaChange,
   onOpenExport,
   onExportsChanged,
 }: LookupRunnerProps) {
@@ -94,7 +99,7 @@ export function LookupRunner({
 
   const [targetsText, setTargetsText] = useState('');
   const [exportLabel, setExportLabel] = useState('usernames');
-  const [delaySeconds, setDelaySeconds] = useState('1.0');
+  const [delaySeconds, setDelaySeconds] = useState('1.5');
   const [fetchProfile, setFetchProfile] = useState(true);
   const [fetchSupplemental, setFetchSupplemental] = useState(true);
   const [withMutuals, setWithMutuals] = useState(true);
@@ -130,9 +135,16 @@ export function LookupRunner({
 
     const timer = window.setInterval(async () => {
       try {
-        const resp = await fetch(`/api/lookups/${encodeURIComponent(job.id)}`);
+        const resp = await apiFetch(`/api/lookups/${encodeURIComponent(job.id)}`);
         if (!resp.ok) return;
-        const data = (await resp.json()) as {ok: boolean; job?: LookupJob};
+        const data = (await resp.json()) as {
+          ok: boolean;
+          job?: LookupJob;
+          quota?: QuotaSnapshot;
+        };
+        if (data.quota) {
+          onQuotaChange(data.quota);
+        }
         if (data.ok && data.job) {
           setJob(data.job);
           if (data.job.savedFiles.csv && notifiedSaveRef.current !== data.job.id) {
@@ -146,7 +158,7 @@ export function LookupRunner({
     }, 650);
 
     return () => window.clearInterval(timer);
-  }, [job, onExportsChanged]);
+  }, [job, onExportsChanged, onQuotaChange]);
 
   const handleVerifyToken = async () => {
     setVerifyError('');
@@ -156,7 +168,7 @@ export function LookupRunner({
     }
     setVerifying(true);
     try {
-      const resp = await fetch('/api/verify', {
+      const resp = await apiFetch('/api/verify', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({token: token.trim()}),
@@ -209,8 +221,8 @@ export function LookupRunner({
     notifiedSaveRef.current = null;
 
     try {
-      const delayMs = Math.round((parseFloat(delaySeconds) || 1.0) * 1000);
-      const resp = await fetch('/api/lookups', {
+      const delayMs = Math.round((parseFloat(delaySeconds) || 1.5) * 1000);
+      const resp = await apiFetch('/api/lookups', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -226,7 +238,15 @@ export function LookupRunner({
           },
         }),
       });
-      const data = (await resp.json()) as {ok: boolean; job?: LookupJob; error?: string};
+      const data = (await resp.json()) as {
+        ok: boolean;
+        job?: LookupJob;
+        quota?: QuotaSnapshot;
+        error?: string;
+      };
+      if (data.quota) {
+        onQuotaChange(data.quota);
+      }
       if (!resp.ok || !data.ok || !data.job) {
         setSubmitError(data.error || 'Failed to start lookup job.');
       } else {
@@ -242,10 +262,17 @@ export function LookupRunner({
   const handleJobAction = async (action: 'pause' | 'resume' | 'stop') => {
     if (!job) return;
     try {
-      const resp = await fetch(`/api/lookups/${encodeURIComponent(job.id)}/${action}`, {
+      const resp = await apiFetch(`/api/lookups/${encodeURIComponent(job.id)}/${action}`, {
         method: 'POST',
       });
-      const data = (await resp.json()) as {ok: boolean; job?: LookupJob};
+      const data = (await resp.json()) as {
+        ok: boolean;
+        job?: LookupJob;
+        quota?: QuotaSnapshot;
+      };
+      if (data.quota) {
+        onQuotaChange(data.quota);
+      }
       if (resp.ok && data.ok && data.job) {
         setJob(data.job);
         if (data.job.savedFiles.csv) {
@@ -381,10 +408,9 @@ export function LookupRunner({
                   disabled={isActive}
                   className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-2.5 py-1.5 font-mono text-xs text-slate-100 focus:border-indigo-500 focus:outline-none disabled:opacity-60"
                 >
-                  <option value="0.5">0.5s (Fast)</option>
-                  <option value="1.0">1.0s (Balanced)</option>
-                  <option value="1.5">1.5s (Gentle)</option>
-                  <option value="2.5">2.5s (Conservative)</option>
+                  <option value="1.2">1.2s (Minimum Safe + Jitter)</option>
+                  <option value="1.5">1.5s (Balanced + Jitter)</option>
+                  <option value="2.5">2.5s (Conservative + Jitter)</option>
                 </select>
               </div>
             </div>
@@ -470,8 +496,18 @@ export function LookupRunner({
           )}
 
           <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-slate-800 pt-4">
-            <div className="text-xs text-slate-400 tabular-nums">
-              {parsedTargetCount} unique {parsedTargetCount === 1 ? 'target' : 'targets'} queued
+            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400 tabular-nums">
+              <span>
+                {parsedTargetCount} unique {parsedTargetCount === 1 ? 'target' : 'targets'} queued
+              </span>
+              {quota && (
+                <>
+                  <span className="text-slate-600" aria-hidden="true">·</span>
+                  <span className={quota.remaining === 0 ? 'text-rose-400' : 'text-slate-300'}>
+                    Free Tier · {quota.used} / {quota.limit} used today · {quota.remaining} remaining · Resets 00:00 UTC
+                  </span>
+                </>
+              )}
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
@@ -479,7 +515,7 @@ export function LookupRunner({
                 <button
                   type="button"
                   onClick={handleStartLookup}
-                  disabled={submitting}
+                  disabled={submitting || (quota !== null && quota.remaining <= 0)}
                   className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-xs font-semibold text-white transition hover:bg-indigo-500 disabled:opacity-50 whitespace-nowrap"
                 >
                   {submitting ? (
@@ -487,7 +523,7 @@ export function LookupRunner({
                   ) : (
                     <Play className="h-3.5 w-3.5" />
                   )}
-                  Lookup & Save
+                  {quota !== null && quota.remaining <= 0 ? 'Daily Limit Reached' : 'Lookup & Save'}
                 </button>
               ) : (
                 <>
@@ -585,20 +621,22 @@ export function LookupRunner({
                   <FileText className="h-3.5 w-3.5 text-indigo-400" />
                   View JSON
                 </button>
-                <a
-                  href={`/api/exports/${encodeURIComponent(job.savedFiles.csv)}?download=1`}
+                <button
+                  type="button"
+                  onClick={() => void downloadExportFile(job.savedFiles.csv!)}
                   className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-indigo-500 whitespace-nowrap"
                 >
                   <Download className="h-3.5 w-3.5" />
                   Download CSV
-                </a>
-                <a
-                  href={`/api/exports/${encodeURIComponent(job.savedFiles.json)}?download=1`}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void downloadExportFile(job.savedFiles.json!)}
                   className="inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-200 transition hover:bg-slate-700 whitespace-nowrap"
                 >
                   <Download className="h-3.5 w-3.5" />
                   Download JSON
-                </a>
+                </button>
               </div>
             )}
           </div>
@@ -610,6 +648,12 @@ export function LookupRunner({
             />
           </div>
 
+          {job.quotaNote && (
+            <p className="mt-2 text-xs text-amber-300">{job.quotaNote}</p>
+          )}
+          {job.haltReason && (
+            <p className="mt-2 text-xs text-rose-400">{job.haltReason}</p>
+          )}
           {job.rateLimitNote && (
             <p className="mt-2 text-xs text-amber-300">{job.rateLimitNote}</p>
           )}

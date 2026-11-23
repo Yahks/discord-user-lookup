@@ -1,8 +1,9 @@
-import {useState} from 'react';
+import {useEffect, useState} from 'react';
 import {FolderArchive, Menu, Search, X} from 'lucide-react';
 import {ExportsViewer} from './components/ExportsViewer';
 import {LookupRunner} from './components/LookupRunner';
-import type {VerifiedAccount} from './types';
+import {apiFetch} from './lib/api';
+import type {QuotaSnapshot, VerifiedAccount} from './types';
 
 type ActiveSection = 'lookup' | 'exports';
 
@@ -17,8 +18,30 @@ export default function App() {
 
   const [token, setToken] = useState('');
   const [verifiedAccount, setVerifiedAccount] = useState<VerifiedAccount | null>(null);
+  const [quota, setQuota] = useState<QuotaSnapshot | null>(null);
   const [selectedExport, setSelectedExport] = useState<string | null>(null);
   const [exportsRefreshSignal, setExportsRefreshSignal] = useState(0);
+
+  useEffect(() => {
+    window.Telegram?.WebApp?.ready?.();
+    window.Telegram?.WebApp?.expand?.();
+
+    let cancelled = false;
+    apiFetch('/api/quota')
+      .then((r) => r.json())
+      .then((data: {ok?: boolean; quota?: QuotaSnapshot}) => {
+        if (!cancelled && data.ok && data.quota) {
+          setQuota(data.quota);
+        }
+      })
+      .catch(() => {
+        // Ignore transient startup errors
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleOpenExport = (filename: string) => {
     setSelectedExport(filename);
@@ -74,22 +97,33 @@ export default function App() {
           })}
         </nav>
 
-        <div className="border-t border-slate-800 p-4 text-xs">
-          <div className="text-slate-400">Active Discord Session</div>
-          {verifiedAccount ? (
-            <div className="mt-1.5">
-              <div className="truncate font-medium text-slate-100">
-                {verifiedAccount.global_name || verifiedAccount.username}
-              </div>
-              <div className="truncate font-mono text-[11px] tabular-nums text-slate-400">
-                @{verifiedAccount.username} · {verifiedAccount.id}
-              </div>
+        <div className="space-y-3 border-t border-slate-800 p-4 text-xs">
+          <div>
+            <div className="text-slate-400">Daily Plan Quota</div>
+            <div className="mt-1 font-mono text-[11px] tabular-nums text-slate-200">
+              {quota
+                ? `Free Tier · ${quota.remaining}/${quota.limit} left today`
+                : 'Free Tier · 50/day'}
             </div>
-          ) : (
-            <div className="mt-1 text-[11px] text-slate-500">
-              Not verified yet
-            </div>
-          )}
+          </div>
+
+          <div className="border-t border-slate-800/80 pt-3">
+            <div className="text-slate-400">Active Discord Session</div>
+            {verifiedAccount ? (
+              <div className="mt-1.5">
+                <div className="truncate font-medium text-slate-100">
+                  {verifiedAccount.global_name || verifiedAccount.username}
+                </div>
+                <div className="truncate font-mono text-[11px] tabular-nums text-slate-400">
+                  @{verifiedAccount.username} · {verifiedAccount.id}
+                </div>
+              </div>
+            ) : (
+              <div className="mt-1 text-[11px] text-slate-500">
+                Not verified yet
+              </div>
+            )}
+          </div>
         </div>
       </aside>
 
@@ -149,6 +183,8 @@ export default function App() {
               }}
               verifiedAccount={verifiedAccount}
               onVerifiedAccountChange={setVerifiedAccount}
+              quota={quota}
+              onQuotaChange={setQuota}
               onOpenExport={handleOpenExport}
               onExportsChanged={() => setExportsRefreshSignal((n) => n + 1)}
             />

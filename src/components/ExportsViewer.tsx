@@ -9,6 +9,7 @@ import {
   Search,
   Trash2,
 } from 'lucide-react';
+import {apiFetch, downloadExportFile} from '../lib/api';
 import type {ExportFileMeta} from '../types';
 
 interface ExportsViewerProps {
@@ -83,7 +84,7 @@ export function ExportsViewer({
   const loadFiles = async () => {
     setLoadingList(true);
     try {
-      const resp = await fetch('/api/exports');
+      const resp = await apiFetch('/api/exports');
       const data = (await resp.json()) as {ok: boolean; files?: ExportFileMeta[]};
       if (resp.ok && data.ok && Array.isArray(data.files)) {
         setFiles(data.files);
@@ -107,7 +108,7 @@ export function ExportsViewer({
     }
     let cancelled = false;
     setLoadingContent(true);
-    fetch(`/api/exports/${encodeURIComponent(selectedFilename)}`)
+    apiFetch(`/api/exports/${encodeURIComponent(selectedFilename)}`)
       .then((r) => r.json())
       .then((data: {ok: boolean; content?: string; format?: 'csv' | 'json'}) => {
         if (!cancelled && data.ok && typeof data.content === 'string') {
@@ -125,7 +126,7 @@ export function ExportsViewer({
   }, [selectedFilename]);
 
   const handleDelete = async (filename: string) => {
-    const resp = await fetch(`/api/exports/${encodeURIComponent(filename)}`, {
+    const resp = await apiFetch(`/api/exports/${encodeURIComponent(filename)}`, {
       method: 'DELETE',
     });
     if (resp.ok) {
@@ -223,14 +224,17 @@ export function ExportsViewer({
                       </span>
                     </div>
                     <div className="flex shrink-0 items-center gap-1">
-                      <a
-                        href={`/api/exports/${encodeURIComponent(file.filename)}?download=1`}
-                        onClick={(e) => e.stopPropagation()}
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void downloadExportFile(file.filename);
+                        }}
                         title="Download file"
                         className="rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-slate-100"
                       >
                         <Download className="h-3.5 w-3.5" />
-                      </a>
+                      </button>
                       <button
                         type="button"
                         onClick={(e) => {
@@ -292,13 +296,14 @@ export function ExportsViewer({
                 )}
                 {copied ? 'Copied' : 'Copy'}
               </button>
-              <a
-                href={`/api/exports/${encodeURIComponent(selectedFilename)}?download=1`}
+              <button
+                type="button"
+                onClick={() => void downloadExportFile(selectedFilename)}
                 className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-500"
               >
                 <Download className="h-3.5 w-3.5" />
                 Download
-              </a>
+              </button>
             </div>
           )}
         </div>

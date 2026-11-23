@@ -1,9 +1,12 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import type {QuotaManager} from './quota.ts';
+import {hashToken} from './security.ts';
 
 const DISCORD_BASE_URL = 'https://discord.com/api/v9';
 const DISCORD_EPOCH_MS = 1420070400000n;
+const MIN_SAFE_DELAY_MS = 1200;
 const USER_AGENT =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36';
 
@@ -53,6 +56,8 @@ export type JobStatus = 'running' | 'paused' | 'completed' | 'stopped' | 'failed
 
 export interface LookupJob {
   id: string;
+  ownerKey: string;
+  ownerHash: string;
   status: JobStatus;
   label: string;
   targets: string[];
@@ -62,6 +67,8 @@ export interface LookupJob {
   failedCount: number;
   currentTarget: string;
   rateLimitNote: string;
+  quotaNote: string;
+  haltReason: string;
   startedAt: string;
   finishedAt: string | null;
   options: LookupOptions;
@@ -189,11 +196,12 @@ export class DiscordApiClient {
       body?: unknown;
       headers?: Record<string, string>;
       onRateLimit?: (seconds: number) => void;
+      onAccountAlert?: (reason: string) => void;
     },
-  ): Promise<{ok: boolean; status: number; data: unknown; error: string}> {
+  ): Promise<{ok: boolean; status: number; data: unknown; error: string; fatalAccountAlert?: string}> {
     const cleanEndpoint = endpoint.replace(/^\/+/, '');
     const url = `${DISCORD_BASE_URL}/${cleanEndpoint}`;
-    const maxRetries = 5;
+    const maxRetries = 3;
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
@@ -222,8 +230,9 @@ export class DiscordApiClient {
             const headerVal = Number(resp.headers.get('retry-after'));
             if (!Number.isNaN(headerVal) && headerVal > 0) retryAfter = headerVal;
           }
-          options?.onRateLimit?.(retryAfter);
-          await sleep(Math.ceil((retryAfter + 0.25) * 1000));
+          const safeWaitSec = retryAfter + 1.0;
+          options?.onRateLimit?.(safeWaitSec);
+          await sleep(Math.ceil(safeWaitSec * 1000));
           continue;
         }
 
@@ -237,12 +246,31 @@ export class DiscordApiClient {
         }
 
         let errMsg = `HTTP ${resp.status}`;
-        if (parsed && typeof parsed === 'object' && 'message' in parsed) {
-          errMsg = String((parsed as Record<string, unknown>).message);
+        let code = 0;
+        let hasCaptcha = false;
+        if (parsed && typeof parsed === 'object') {
+          const obj = parsed as Record<string, unknown>;
+          if ('message' in obj) errMsg = String(obj.message);
+          if ('code' in obj) code = Number(obj.code) || 0;
+          if ('captcha_key' in obj) hasCaptcha = true;
         } else if (typeof parsed === 'string' && parsed.trim()) {
           errMsg = parsed.slice(0, 200);
         }
-        return {ok: false, status: resp.status, data: parsed, error: errMsg};
+
+        let fatalAccountAlert = '';
+        if (resp.status === 401) {
+          fatalAccountAlert = 'Token rejected (401 Unauthorized). Halted to protect account.';
+        } else if (hasCaptcha) {
+          fatalAccountAlert = 'Discord requested CAPTCHA verification. Halted to protect account.';
+        } else if (resp.status === 403 && code === 40002) {
+          fatalAccountAlert = 'Discord requested account verification (40002). Halted to protect account.';
+        }
+
+        if (fatalAccountAlert) {
+          options?.onAccountAlert?.(fatalAccountAlert);
+        }
+
+        return {ok: false, status: resp.status, data: parsed, error: errMsg, fatalAccountAlert};
       } catch (err) {
         if (attempt === maxRetries - 1) {
           const message = err instanceof Error ? err.message : 'Network error';
@@ -359,13 +387,18 @@ export class DiscordApiClient {
   async lookupTarget(
     target: string,
     opts: LookupOptions,
-    onRateLimit?: (seconds: number) => void,
+    callbacks?: {
+      onRateLimit?: (seconds: number) => void;
+      onAccountAlert?: (reason: string) => void;
+    },
   ): Promise<LookupResultEntry> {
     const query = target.trim();
     let uid = query;
     let resolvedFrom = 'user_id';
     let preResolvedUser: Record<string, unknown> = {};
     let preChannelId = '';
+    const onRateLimit = callbacks?.onRateLimit;
+    const onAccountAlert = callbacks?.onAccountAlert;
 
     if (!/^\d+$/.test(query)) {
       const resolved = await this.resolveUsernameToId(query, onRateLimit);
@@ -408,10 +441,42 @@ export class DiscordApiClient {
         Referer: 'https://discord.com/channels/@me',
       },
       onRateLimit,
+      onAccountAlert,
     });
 
+    if (dmRes.fatalAccountAlert) {
+      return {
+        query,
+        id: uid,
+        status: 'failed',
+        resolved_from: resolvedFrom,
+        username: '',
+        global_name: '',
+        discriminator: '0',
+        tag: '',
+        bot: false,
+        created_at: snowflakeToIso(uid),
+        avatar: '',
+        avatar_url: '',
+        public_flags: 0,
+        bio: '',
+        pronouns: '',
+        badges: [],
+        connected_accounts: [],
+        mutual_guilds: [],
+        mutual_friends: [],
+        dm_channel_id: '',
+        message_count_sampled: 0,
+        error: dmRes.fatalAccountAlert,
+        raw: {},
+      };
+    }
+
     if (!dmRes.ok && /^\d+$/.test(query)) {
-      const chRes = await this.request('GET', `channels/${encodeURIComponent(query)}`, {onRateLimit});
+      const chRes = await this.request('GET', `channels/${encodeURIComponent(query)}`, {
+        onRateLimit,
+        onAccountAlert,
+      });
       if (chRes.ok && chRes.data && typeof chRes.data === 'object') {
         const chData = chRes.data as Record<string, unknown>;
         const recipients = Array.isArray(chData.recipients) ? chData.recipients : [];
@@ -453,6 +518,7 @@ export class DiscordApiClient {
         {
           headers: {Referer: `https://discord.com/channels/@me/${channelId}`},
           onRateLimit,
+          onAccountAlert,
         },
       );
       if (suppRes.ok) supplementalData = suppRes.data;
@@ -478,6 +544,7 @@ export class DiscordApiClient {
               : 'https://discord.com/channels/@me',
           },
           onRateLimit,
+          onAccountAlert,
         },
       );
 
@@ -497,6 +564,7 @@ export class DiscordApiClient {
         {
           headers: {Referer: `https://discord.com/channels/@me/${channelId}`},
           onRateLimit,
+          onAccountAlert,
         },
       );
       if (msgRes.ok && Array.isArray(msgRes.data)) {
@@ -590,10 +658,14 @@ export class DiscordApiClient {
 
 export class LookupJobManager {
   private readonly jobs = new Map<string, LookupJob>();
+  private readonly activeOwners = new Set<string>();
+  private readonly activeTokens = new Set<string>();
   private readonly exportsDir: string;
+  private readonly quotaManager: QuotaManager;
 
-  constructor(exportsDir: string) {
+  constructor(exportsDir: string, quotaManager: QuotaManager) {
     this.exportsDir = exportsDir;
+    this.quotaManager = quotaManager;
   }
 
   async init(): Promise<void> {
@@ -604,29 +676,80 @@ export class LookupJobManager {
     return this.jobs.get(jobId);
   }
 
-  startJob(token: string, targets: string[], options: LookupOptions): LookupJob {
+  startJob(
+    ownerKey: string,
+    ownerHash: string,
+    token: string,
+    targets: string[],
+    options: LookupOptions,
+  ): {ok: true; job: LookupJob} | {ok: false; status: number; error: string} {
+    if (this.activeOwners.has(ownerKey)) {
+      return {
+        ok: false,
+        status: 409,
+        error: 'You already have an active lookup job running. Wait for it to finish or stop it first.',
+      };
+    }
+
+    const tokenDigest = hashToken(token);
+    if (this.activeTokens.has(tokenDigest)) {
+      return {
+        ok: false,
+        status: 409,
+        error: 'This Discord token is already running another lookup job. Concurrent jobs are blocked to protect the account.',
+      };
+    }
+
+    const quota = this.quotaManager.getQuota(ownerKey);
+    if (quota.remaining <= 0) {
+      return {
+        ok: false,
+        status: 429,
+        error: `Free tier daily limit reached (${quota.limit}/${quota.limit} lookups used today). Resets at 00:00 UTC.`,
+      };
+    }
+
+    let cappedTargets = targets;
+    let quotaNote = '';
+    if (targets.length > quota.remaining) {
+      cappedTargets = targets.slice(0, quota.remaining);
+      quotaNote = `Free tier limit (${quota.limit}/day): capped batch from ${targets.length} to ${quota.remaining} remaining lookups today.`;
+    }
+
+    const safeDelayMs = Math.max(MIN_SAFE_DELAY_MS, options.delayMs || MIN_SAFE_DELAY_MS);
+    const safeOptions: LookupOptions = {
+      ...options,
+      delayMs: safeDelayMs,
+    };
+
     const id = crypto.randomUUID();
     const job: LookupJob = {
       id,
+      ownerKey,
+      ownerHash,
       status: 'running',
-      label: options.label || 'usernames',
-      targets,
+      label: safeOptions.label || 'usernames',
+      targets: cappedTargets,
       currentIndex: 0,
-      total: targets.length,
+      total: cappedTargets.length,
       resolvedCount: 0,
       failedCount: 0,
-      currentTarget: targets[0] ?? '',
+      currentTarget: cappedTargets[0] ?? '',
       rateLimitNote: '',
+      quotaNote,
+      haltReason: '',
       startedAt: new Date().toISOString(),
       finishedAt: null,
-      options,
+      options: safeOptions,
       results: [],
       savedFiles: {csv: null, json: null},
     };
 
     this.jobs.set(id, job);
-    void this.runLoop(job, token);
-    return job;
+    this.activeOwners.add(ownerKey);
+    this.activeTokens.add(tokenDigest);
+    void this.runLoop(job, token, tokenDigest);
+    return {ok: true, job};
   }
 
   pauseJob(jobId: string): LookupJob | null {
@@ -660,7 +783,7 @@ export class LookupJobManager {
     return job;
   }
 
-  private async runLoop(job: LookupJob, token: string): Promise<void> {
+  private async runLoop(job: LookupJob, token: string, tokenDigest: string): Promise<void> {
     const client = new DiscordApiClient(token);
     const getStatus = (): JobStatus => job.status;
 
@@ -674,12 +797,25 @@ export class LookupJobManager {
         }
         if (getStatus() === 'stopped') break;
 
+        const consumed = await this.quotaManager.consumeOne(job.ownerKey);
+        if (!consumed.allowed) {
+          job.haltReason = `Daily free tier limit reached (${consumed.quota.limit}/${consumed.quota.limit} lookups used today).`;
+          job.status = 'stopped';
+          break;
+        }
+
         const target = job.targets[job.currentIndex];
         job.currentTarget = target;
         job.rateLimitNote = '';
 
-        const entry = await client.lookupTarget(target, job.options, (sec) => {
-          job.rateLimitNote = `Rate limited — waiting ${sec.toFixed(1)}s before continuing`;
+        let fatalAlert = '';
+        const entry = await client.lookupTarget(target, job.options, {
+          onRateLimit: (sec) => {
+            job.rateLimitNote = `Discord rate limit — cooling down ${sec.toFixed(1)}s`;
+          },
+          onAccountAlert: (reason) => {
+            fatalAlert = reason;
+          },
         });
 
         job.rateLimitNote = '';
@@ -691,11 +827,19 @@ export class LookupJobManager {
         }
         job.currentIndex += 1;
 
-        if (job.currentIndex < job.targets.length && job.options.delayMs > 0) {
-          const steps = Math.max(1, Math.ceil(job.options.delayMs / 200));
+        if (fatalAlert) {
+          job.haltReason = fatalAlert;
+          job.status = 'stopped';
+          break;
+        }
+
+        if (job.currentIndex < job.targets.length) {
+          const jitterMs = 250 + Math.floor(Math.random() * 600);
+          const totalDelay = job.options.delayMs + jitterMs;
+          const steps = Math.max(1, Math.ceil(totalDelay / 200));
           for (let s = 0; s < steps; s++) {
             if (getStatus() !== 'running') break;
-            await sleep(Math.min(200, job.options.delayMs));
+            await sleep(Math.min(200, totalDelay));
           }
         }
       }
@@ -705,18 +849,29 @@ export class LookupJobManager {
       }
       job.currentTarget = '';
       job.finishedAt = new Date().toISOString();
-      await this.persistExportFiles(job);
+      if (job.results.length > 0) {
+        await this.persistExportFiles(job);
+      }
     } catch {
       job.status = 'failed';
       job.finishedAt = new Date().toISOString();
       if (job.results.length > 0) {
         await this.persistExportFiles(job);
       }
+    } finally {
+      this.activeOwners.delete(job.ownerKey);
+      this.activeTokens.delete(tokenDigest);
     }
   }
 
   async persistExportFiles(job: LookupJob): Promise<{csv: string; json: string}> {
     await this.init();
+    const ownerDir = path.resolve(this.exportsDir, job.ownerHash);
+    if (!ownerDir.startsWith(this.exportsDir + path.sep)) {
+      throw new Error('Invalid owner export directory');
+    }
+    await fs.mkdir(ownerDir, {recursive: true});
+
     const now = new Date();
     const stamp = now.toISOString().replace(/[-:]/g, '').replace('T', '_').slice(0, 15);
     const safeLabel = job.label.replace(/[^a-zA-Z0-9_-]/g, '') || 'lookup';
@@ -739,7 +894,7 @@ export class LookupJobManager {
       results: job.results,
     };
 
-    const jsonPath = path.resolve(this.exportsDir, jsonFilename);
+    const jsonPath = path.resolve(ownerDir, jsonFilename);
     await fs.writeFile(jsonPath, JSON.stringify(jsonPayload, null, 2), 'utf8');
 
     const headers = [
@@ -797,7 +952,7 @@ export class LookupJobManager {
       );
     }
 
-    const csvPath = path.resolve(this.exportsDir, csvFilename);
+    const csvPath = path.resolve(ownerDir, csvFilename);
     await fs.writeFile(csvPath, lines.join('\n'), 'utf8');
 
     job.savedFiles = {csv: csvFilename, json: jsonFilename};

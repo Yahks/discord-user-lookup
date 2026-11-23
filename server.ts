@@ -6,19 +6,36 @@ import {createServer as createViteServer} from 'vite';
 import {
   DiscordApiClient,
   LookupJobManager,
+  type LookupJob,
   type LookupOptions,
 } from './server/discordLookup.ts';
+import {QuotaManager} from './server/quota.ts';
+import {
+  createBurstRateLimiter,
+  resolveRequestIdentity,
+  type VerifiedIdentity,
+} from './server/security.ts';
 import {TelegramBotRunner} from './server/telegramBot.ts';
 
 const PORT = 3000;
 const EXPORTS_DIR = path.resolve(process.cwd(), 'exports');
+const DATA_DIR = path.resolve(process.cwd(), 'data');
 const FILENAME_REGEX = /^[a-zA-Z0-9._-]+\.(csv|json)$/;
+const FREE_DAILY_LIMIT = Math.max(1, Number(process.env.FREE_DAILY_LIMIT || 50) || 50);
 
-function resolveExportPath(filename: string): string | null {
+function resolveOwnerExportPath(ownerHash: string, filename: string): string | null {
+  if (!/^[a-f0-9]{16}$/.test(ownerHash)) return null;
   if (!FILENAME_REGEX.test(filename)) return null;
-  const resolved = path.resolve(EXPORTS_DIR, filename);
-  if (!resolved.startsWith(EXPORTS_DIR + path.sep)) return null;
+  const ownerDir = path.resolve(EXPORTS_DIR, ownerHash);
+  if (!ownerDir.startsWith(EXPORTS_DIR + path.sep)) return null;
+  const resolved = path.resolve(ownerDir, filename);
+  if (!resolved.startsWith(ownerDir + path.sep)) return null;
   return resolved;
+}
+
+function sanitizeJobForClient(job: LookupJob) {
+  const {ownerKey: _ownerKey, ownerHash: _ownerHash, ...safeJob} = job;
+  return safeJob;
 }
 
 function parseTargets(rawTargets: unknown): string[] {
@@ -38,12 +55,20 @@ function parseTargets(rawTargets: unknown): string[] {
       if (clean) list.push(clean);
     }
   }
-  return Array.from(new Set(list)).slice(0, 500);
+  return Array.from(new Set(list)).slice(0, FREE_DAILY_LIMIT);
 }
 
 async function startServer(): Promise<void> {
   const app = express();
-  const jobManager = new LookupJobManager(EXPORTS_DIR);
+  app.set('trust proxy', 1);
+
+  const botToken = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+  const requireTelegramInitData = process.env.TELEGRAM_REQUIRE_INIT_DATA === 'true';
+
+  const quotaManager = new QuotaManager(DATA_DIR, FREE_DAILY_LIMIT);
+  await quotaManager.init();
+
+  const jobManager = new LookupJobManager(EXPORTS_DIR, quotaManager);
   await jobManager.init();
 
   const allowedUsers = (process.env.TELEGRAM_ALLOWED_USER_IDS || '')
@@ -52,19 +77,60 @@ async function startServer(): Promise<void> {
     .filter((n) => Number.isInteger(n) && n > 0);
 
   const telegramBot = new TelegramBotRunner({
-    botToken: process.env.TELEGRAM_BOT_TOKEN || '',
+    botToken,
     jobManager,
+    quotaManager,
     exportsDir: EXPORTS_DIR,
     allowedUserIds: allowedUsers,
   });
 
-  app.use(express.json({limit: '1mb'}));
-
-  app.get('/api/telegram/status', (_req, res) => {
-    res.json({ok: true, status: telegramBot.getStatus()});
+  app.disable('x-powered-by');
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    next();
   });
 
-  app.post('/api/verify', async (req, res) => {
+  app.use(express.json({limit: '256kb'}));
+
+  const generalApiLimiter = createBurstRateLimiter({
+    windowMs: 60_000,
+    maxRequests: 60,
+    bucketName: 'api_general',
+  });
+  const verifyLimiter = createBurstRateLimiter({
+    windowMs: 60_000,
+    maxRequests: 8,
+    bucketName: 'api_verify',
+  });
+  const lookupStartLimiter = createBurstRateLimiter({
+    windowMs: 60_000,
+    maxRequests: 10,
+    bucketName: 'api_lookup_start',
+  });
+
+  // Resolve verified Telegram Mini App or IP identity for all /api routes
+  app.use('/api', (req, res, next) => {
+    const identity = resolveRequestIdentity(req, botToken, requireTelegramInitData);
+    if (!identity.ok) {
+      res.status(identity.status).json({ok: false, error: identity.error});
+      return;
+    }
+    res.locals.identity = identity;
+    next();
+  }, generalApiLimiter);
+
+  app.get('/api/quota', (_req, res) => {
+    const identity = res.locals.identity as VerifiedIdentity;
+    res.json({
+      ok: true,
+      quota: quotaManager.getQuota(identity.ownerKey),
+      source: identity.source,
+    });
+  });
+
+  app.post('/api/verify', verifyLimiter, async (req, res) => {
     const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
     if (!token || token.length > 500) {
       res.status(400).json({ok: false, error: 'Please enter a valid Discord token.'});
@@ -80,7 +146,8 @@ async function startServer(): Promise<void> {
     res.json({ok: true, account: result.account});
   });
 
-  app.post('/api/lookups', (req, res) => {
+  app.post('/api/lookups', lookupStartLimiter, (req, res) => {
+    const identity = res.locals.identity as VerifiedIdentity;
     const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
     if (!token || token.length > 500) {
       res.status(400).json({ok: false, error: 'A Discord token is required.'});
@@ -98,10 +165,10 @@ async function startServer(): Promise<void> {
 
     const rawOpts =
       req.body?.options && typeof req.body.options === 'object' ? req.body.options : {};
-    const delayMsRaw = Number(rawOpts.delayMs ?? 1000);
+    const delayMsRaw = Number(rawOpts.delayMs ?? 1500);
     const delayMs = Number.isFinite(delayMsRaw)
-      ? Math.min(Math.max(250, delayMsRaw), 10000)
-      : 1000;
+      ? Math.min(Math.max(1200, delayMsRaw), 10000)
+      : 1500;
     const rawLabel = typeof rawOpts.label === 'string' ? rawOpts.label : 'usernames';
     const label = rawLabel.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40) || 'usernames';
 
@@ -116,54 +183,95 @@ async function startServer(): Promise<void> {
       label,
     };
 
-    const job = jobManager.startJob(token, targets, options);
-    res.status(201).json({ok: true, job});
+    const started = jobManager.startJob(
+      identity.ownerKey,
+      identity.ownerHash,
+      token,
+      targets,
+      options,
+    );
+    if (!started.ok) {
+      res.status(started.status).json({
+        ok: false,
+        error: started.error,
+        quota: quotaManager.getQuota(identity.ownerKey),
+      });
+      return;
+    }
+
+    res.status(201).json({
+      ok: true,
+      job: sanitizeJobForClient(started.job),
+      quota: quotaManager.getQuota(identity.ownerKey),
+    });
   });
 
   app.get('/api/lookups/:jobId', (req, res) => {
+    const identity = res.locals.identity as VerifiedIdentity;
     const job = jobManager.getJob(req.params.jobId);
-    if (!job) {
+    if (!job || job.ownerKey !== identity.ownerKey) {
       res.status(404).json({ok: false, error: 'Lookup job not found.'});
       return;
     }
-    res.json({ok: true, job});
+    res.json({
+      ok: true,
+      job: sanitizeJobForClient(job),
+      quota: quotaManager.getQuota(identity.ownerKey),
+    });
   });
 
   app.post('/api/lookups/:jobId/pause', (req, res) => {
-    const job = jobManager.pauseJob(req.params.jobId);
-    if (!job) {
+    const identity = res.locals.identity as VerifiedIdentity;
+    const existing = jobManager.getJob(req.params.jobId);
+    if (!existing || existing.ownerKey !== identity.ownerKey) {
       res.status(404).json({ok: false, error: 'Lookup job not found.'});
       return;
     }
-    res.json({ok: true, job});
+    const job = jobManager.pauseJob(req.params.jobId);
+    res.json({ok: true, job: job ? sanitizeJobForClient(job) : null});
   });
 
   app.post('/api/lookups/:jobId/resume', (req, res) => {
-    const job = jobManager.resumeJob(req.params.jobId);
-    if (!job) {
+    const identity = res.locals.identity as VerifiedIdentity;
+    const existing = jobManager.getJob(req.params.jobId);
+    if (!existing || existing.ownerKey !== identity.ownerKey) {
       res.status(404).json({ok: false, error: 'Lookup job not found.'});
       return;
     }
-    res.json({ok: true, job});
+    const job = jobManager.resumeJob(req.params.jobId);
+    res.json({ok: true, job: job ? sanitizeJobForClient(job) : null});
   });
 
   app.post('/api/lookups/:jobId/stop', async (req, res) => {
-    const job = await jobManager.stopJob(req.params.jobId);
-    if (!job) {
+    const identity = res.locals.identity as VerifiedIdentity;
+    const existing = jobManager.getJob(req.params.jobId);
+    if (!existing || existing.ownerKey !== identity.ownerKey) {
       res.status(404).json({ok: false, error: 'Lookup job not found.'});
       return;
     }
-    res.json({ok: true, job});
+    const job = await jobManager.stopJob(req.params.jobId);
+    res.json({
+      ok: true,
+      job: job ? sanitizeJobForClient(job) : null,
+      quota: quotaManager.getQuota(identity.ownerKey),
+    });
   });
 
   app.get('/api/exports', async (_req, res) => {
+    const identity = res.locals.identity as VerifiedIdentity;
+    const ownerDir = path.resolve(EXPORTS_DIR, identity.ownerHash);
+    if (!ownerDir.startsWith(EXPORTS_DIR + path.sep)) {
+      res.status(400).json({ok: false, error: 'Invalid export scope.'});
+      return;
+    }
+
     try {
-      await fs.mkdir(EXPORTS_DIR, {recursive: true});
-      const entries = await fs.readdir(EXPORTS_DIR);
+      await fs.mkdir(ownerDir, {recursive: true});
+      const entries = await fs.readdir(ownerDir);
       const files = [];
 
       for (const name of entries) {
-        const resolved = resolveExportPath(name);
+        const resolved = resolveOwnerExportPath(identity.ownerHash, name);
         if (!resolved) continue;
         const stat = await fs.stat(resolved);
         if (!stat.isFile()) continue;
@@ -200,7 +308,8 @@ async function startServer(): Promise<void> {
   });
 
   app.get('/api/exports/:filename', async (req, res) => {
-    const resolved = resolveExportPath(req.params.filename);
+    const identity = res.locals.identity as VerifiedIdentity;
+    const resolved = resolveOwnerExportPath(identity.ownerHash, req.params.filename);
     if (!resolved) {
       res.status(400).json({ok: false, error: 'Invalid export filename.'});
       return;
@@ -213,7 +322,10 @@ async function startServer(): Promise<void> {
 
       if (isDownload) {
         res.setHeader('Content-Disposition', `attachment; filename="${req.params.filename}"`);
-        res.setHeader('Content-Type', isCsv ? 'text/csv; charset=utf-8' : 'application/json; charset=utf-8');
+        res.setHeader(
+          'Content-Type',
+          isCsv ? 'text/csv; charset=utf-8' : 'application/json; charset=utf-8',
+        );
         res.send(content);
         return;
       }
@@ -230,7 +342,8 @@ async function startServer(): Promise<void> {
   });
 
   app.delete('/api/exports/:filename', async (req, res) => {
-    const resolved = resolveExportPath(req.params.filename);
+    const identity = res.locals.identity as VerifiedIdentity;
+    const resolved = resolveOwnerExportPath(identity.ownerHash, req.params.filename);
     if (!resolved) {
       res.status(400).json({ok: false, error: 'Invalid export filename.'});
       return;
@@ -260,7 +373,7 @@ async function startServer(): Promise<void> {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`LookupDesk SaaS server listening on http://localhost:${PORT}`);
-    if (process.env.TELEGRAM_BOT_TOKEN) {
+    if (botToken) {
       void telegramBot.start();
     }
   });

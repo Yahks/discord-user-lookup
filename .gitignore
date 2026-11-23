@@ -8,3 +8,14 @@ coverage/
 !.env.example
 exports/
 account.json
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+exports/
+data/
+account.json
