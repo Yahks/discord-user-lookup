@@ -1,18 +1,14 @@
 import {useState} from 'react';
-import {FolderArchive, Menu, Search, Send, Terminal, X} from 'lucide-react';
-import {CliReference} from './components/CliReference';
+import {FolderArchive, Menu, Search, X} from 'lucide-react';
 import {ExportsViewer} from './components/ExportsViewer';
 import {LookupRunner} from './components/LookupRunner';
-import {TelegramBotTab} from './components/TelegramBotTab';
 import type {VerifiedAccount} from './types';
 
-type ActiveSection = 'lookup' | 'exports' | 'telegram' | 'cli';
+type ActiveSection = 'lookup' | 'exports';
 
 const NAV_ITEMS: {id: ActiveSection; label: string; icon: typeof Search}[] = [
   {id: 'lookup', label: 'Lookup Runner', icon: Search},
   {id: 'exports', label: 'Saved Exports', icon: FolderArchive},
-  {id: 'telegram', label: 'Telegram Bot', icon: Send},
-  {id: 'cli', label: 'Python CLI', icon: Terminal},
 ];
 
 export default function App() {
@@ -30,14 +26,7 @@ export default function App() {
     setExportsRefreshSignal((n) => n + 1);
   };
 
-  const sectionTitle =
-    section === 'lookup'
-      ? 'Lookup Runner'
-      : section === 'exports'
-        ? 'Saved Exports'
-        : section === 'telegram'
-          ? 'Telegram Bot'
-          : 'Python CLI';
+  const sectionTitle = section === 'lookup' ? 'Lookup Runner' : 'Saved Exports';
 
   return (
     <div className="flex min-h-screen bg-[#090d16] text-slate-100">
@@ -172,10 +161,6 @@ export default function App() {
               refreshSignal={exportsRefreshSignal}
             />
           )}
-
-          {section === 'telegram' && <TelegramBotTab />}
-
-          {section === 'cli' && <CliReference />}
         </main>
       </div>
     </div>
