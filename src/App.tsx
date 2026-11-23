@@ -1,13 +1,14 @@
 import {useEffect, useState} from 'react';
-import {FolderArchive, Menu, Search, X} from 'lucide-react';
+import {FolderArchive, Menu, Search, Users, X} from 'lucide-react';
+import {ActivityMonitor} from './components/ActivityMonitor';
 import {ExportsViewer} from './components/ExportsViewer';
 import {LookupRunner} from './components/LookupRunner';
 import {apiFetch} from './lib/api';
 import type {QuotaSnapshot, VerifiedAccount} from './types';
 
-type ActiveSection = 'lookup' | 'exports';
+type ActiveSection = 'lookup' | 'exports' | 'activity';
 
-const NAV_ITEMS: {id: ActiveSection; label: string; icon: typeof Search}[] = [
+const BASE_NAV_ITEMS: {id: ActiveSection; label: string; icon: typeof Search}[] = [
   {id: 'lookup', label: 'Lookup Runner', icon: Search},
   {id: 'exports', label: 'Saved Exports', icon: FolderArchive},
 ];
@@ -19,6 +20,7 @@ export default function App() {
   const [token, setToken] = useState('');
   const [verifiedAccount, setVerifiedAccount] = useState<VerifiedAccount | null>(null);
   const [quota, setQuota] = useState<QuotaSnapshot | null>(null);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [selectedExport, setSelectedExport] = useState<string | null>(null);
   const [exportsRefreshSignal, setExportsRefreshSignal] = useState(0);
 
@@ -29,9 +31,10 @@ export default function App() {
     let cancelled = false;
     apiFetch('/api/quota')
       .then((r) => r.json())
-      .then((data: {ok?: boolean; quota?: QuotaSnapshot}) => {
-        if (!cancelled && data.ok && data.quota) {
-          setQuota(data.quota);
+      .then((data: {ok?: boolean; quota?: QuotaSnapshot; isAdmin?: boolean}) => {
+        if (!cancelled && data.ok) {
+          if (data.quota) setQuota(data.quota);
+          setIsAdmin(Boolean(data.isAdmin));
         }
       })
       .catch(() => {
@@ -49,7 +52,16 @@ export default function App() {
     setExportsRefreshSignal((n) => n + 1);
   };
 
-  const sectionTitle = section === 'lookup' ? 'Lookup Runner' : 'Saved Exports';
+  const navItems = isAdmin
+    ? [...BASE_NAV_ITEMS, {id: 'activity' as const, label: 'User Activity', icon: Users}]
+    : BASE_NAV_ITEMS;
+
+  const sectionTitle =
+    section === 'lookup'
+      ? 'Lookup Runner'
+      : section === 'exports'
+        ? 'Saved Exports'
+        : 'User Activity';
 
   return (
     <div className="flex min-h-screen bg-[#090d16] text-slate-100">
@@ -73,7 +85,7 @@ export default function App() {
         </div>
 
         <nav className="flex-1 space-y-1 p-3">
-          {NAV_ITEMS.map((item) => {
+          {navItems.map((item) => {
             const Icon = item.icon;
             const active = section === item.id;
             return (
@@ -197,6 +209,8 @@ export default function App() {
               refreshSignal={exportsRefreshSignal}
             />
           )}
+
+          {section === 'activity' && isAdmin && <ActivityMonitor />}
         </main>
       </div>
     </div>

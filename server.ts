@@ -3,6 +3,7 @@ import express from 'express';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {createServer as createViteServer} from 'vite';
+import {ActivityTracker} from './server/activityTracker.ts';
 import {
   DiscordApiClient,
   LookupJobManager,
@@ -12,6 +13,7 @@ import {
 import {QuotaManager} from './server/quota.ts';
 import {
   createBurstRateLimiter,
+  hashOwnerKey,
   resolveRequestIdentity,
   type VerifiedIdentity,
 } from './server/security.ts';
@@ -68,7 +70,53 @@ async function startServer(): Promise<void> {
   const quotaManager = new QuotaManager(DATA_DIR, FREE_DAILY_LIMIT);
   await quotaManager.init();
 
-  const jobManager = new LookupJobManager(EXPORTS_DIR, quotaManager);
+  const activityTracker = new ActivityTracker(DATA_DIR);
+  await activityTracker.init();
+
+  const jobActorMeta = new Map<
+    string,
+    {
+      channel: 'telegram_bot' | 'telegram_webapp' | 'web';
+      telegramUserId?: number;
+      telegramUsername?: string;
+      firstName?: string;
+    }
+  >();
+
+  const jobManager = new LookupJobManager(EXPORTS_DIR, quotaManager, {
+    onJobFinished: (job) => {
+      const actor = jobActorMeta.get(job.id);
+      jobActorMeta.delete(job.id);
+      const isBot = job.label.startsWith('tg_');
+      const channel = actor?.channel ?? (isBot ? 'telegram_bot' : 'web');
+      const existing = activityTracker.getUserDetail(job.ownerKey, quotaManager, 1);
+      const action = job.haltReason
+        ? 'lookup_halted'
+        : job.status === 'completed'
+          ? 'lookup_completed'
+          : 'lookup_stopped';
+      const details = job.haltReason
+        ? `${job.haltReason} (${job.resolvedCount}/${job.total} resolved)`
+        : `Batch ${job.status}: ${job.resolvedCount} resolved, ${job.failedCount} failed of ${job.total}`;
+
+      activityTracker.record({
+        ownerKey: job.ownerKey,
+        ownerHash: job.ownerHash,
+        channel,
+        telegramUserId: actor?.telegramUserId ?? existing?.user.telegramUserId,
+        telegramUsername: actor?.telegramUsername ?? existing?.user.telegramUsername,
+        firstName: actor?.firstName ?? existing?.user.firstName,
+        action,
+        details,
+        targetsCount: job.total,
+        increments: {
+          lookupsProcessed: job.results.length,
+          lookupsResolved: job.resolvedCount,
+          lookupsFailed: job.failedCount,
+        },
+      });
+    },
+  });
   await jobManager.init();
 
   const allowedUsers = (process.env.TELEGRAM_ALLOWED_USER_IDS || '')
@@ -76,13 +124,64 @@ async function startServer(): Promise<void> {
     .map((s) => Number(s.trim()))
     .filter((n) => Number.isInteger(n) && n > 0);
 
+  const adminUsersList = (process.env.TELEGRAM_ADMIN_USER_IDS || '')
+    .split(',')
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isInteger(n) && n > 0);
+  const adminUserIds = new Set<number>(adminUsersList);
+  const adminAlertsEnabled = process.env.TELEGRAM_ADMIN_ALERTS !== 'false';
+
   const telegramBot = new TelegramBotRunner({
     botToken,
     jobManager,
     quotaManager,
+    activityTracker,
     exportsDir: EXPORTS_DIR,
     allowedUserIds: allowedUsers,
+    adminUserIds: adminUsersList,
+    adminAlertsEnabled,
   });
+
+  function recordWebActivity(
+    identity: VerifiedIdentity,
+    action: string,
+    details: string,
+    extra?: {
+      discordAccountId?: string;
+      discordUsername?: string;
+      targetsCount?: number;
+      targetsSample?: string[];
+      increments?: {
+        jobsStarted?: number;
+        exportsDownloaded?: number;
+        blocked?: number;
+      };
+    },
+  ): void {
+    activityTracker.record({
+      ownerKey: identity.ownerKey,
+      ownerHash: identity.ownerHash,
+      channel: identity.source === 'telegram_webapp' ? 'telegram_webapp' : 'web',
+      telegramUserId: identity.telegramUserId,
+      telegramUsername: identity.telegramUsername,
+      firstName: identity.telegramFirstName,
+      discordAccountId: extra?.discordAccountId,
+      discordUsername: extra?.discordUsername,
+      action,
+      details,
+      targetsCount: extra?.targetsCount,
+      targetsSample: extra?.targetsSample,
+      increments: extra?.increments,
+    });
+  }
+
+  function isVerifiedAdmin(identity: VerifiedIdentity): boolean {
+    return (
+      identity.source === 'telegram_webapp' &&
+      typeof identity.telegramUserId === 'number' &&
+      adminUserIds.has(identity.telegramUserId)
+    );
+  }
 
   app.disable('x-powered-by');
   app.use((_req, res, next) => {
@@ -114,6 +213,15 @@ async function startServer(): Promise<void> {
   app.use('/api', (req, res, next) => {
     const identity = resolveRequestIdentity(req, botToken, requireTelegramInitData);
     if (!identity.ok) {
+      const ipKey = `ip:${req.ip || req.socket.remoteAddress || 'unknown'}`;
+      activityTracker.record({
+        ownerKey: ipKey,
+        ownerHash: hashOwnerKey(ipKey),
+        channel: 'web',
+        action: 'unauthorized_access',
+        details: `Rejected /api request (${identity.error})`,
+        increments: {blocked: 1},
+      });
       res.status(identity.status).json({ok: false, error: identity.error});
       return;
     }
@@ -127,10 +235,12 @@ async function startServer(): Promise<void> {
       ok: true,
       quota: quotaManager.getQuota(identity.ownerKey),
       source: identity.source,
+      isAdmin: isVerifiedAdmin(identity),
     });
   });
 
   app.post('/api/verify', verifyLimiter, async (req, res) => {
+    const identity = res.locals.identity as VerifiedIdentity;
     const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
     if (!token || token.length > 500) {
       res.status(400).json({ok: false, error: 'Please enter a valid Discord token.'});
@@ -139,10 +249,24 @@ async function startServer(): Promise<void> {
 
     const client = new DiscordApiClient(token);
     const result = await client.verifyToken();
-    if (!result.ok) {
+    if (!result.ok || !result.account) {
+      recordWebActivity(
+        identity,
+        'token_verify_failed',
+        `Discord token rejected: ${result.error || 'Unauthorized'}`,
+      );
       res.status(401).json({ok: false, error: result.error || 'Token verification failed.'});
       return;
     }
+    recordWebActivity(
+      identity,
+      'token_verified',
+      `Verified Discord @${result.account.username} (${result.account.id})`,
+      {
+        discordAccountId: result.account.id,
+        discordUsername: result.account.username,
+      },
+    );
     res.json({ok: true, account: result.account});
   });
 
@@ -191,6 +315,12 @@ async function startServer(): Promise<void> {
       options,
     );
     if (!started.ok) {
+      const action = started.status === 429 ? 'quota_blocked' : 'lookup_rejected';
+      recordWebActivity(identity, action, started.error, {
+        targetsCount: targets.length,
+        targetsSample: targets.slice(0, 5),
+        increments: started.status === 429 ? {blocked: 1} : undefined,
+      });
       res.status(started.status).json({
         ok: false,
         error: started.error,
@@ -198,6 +328,23 @@ async function startServer(): Promise<void> {
       });
       return;
     }
+
+    jobActorMeta.set(started.job.id, {
+      channel: identity.source === 'telegram_webapp' ? 'telegram_webapp' : 'web',
+      telegramUserId: identity.telegramUserId,
+      telegramUsername: identity.telegramUsername,
+      firstName: identity.telegramFirstName,
+    });
+    recordWebActivity(
+      identity,
+      'lookup_started',
+      `Started lookup batch (${started.job.total} target${started.job.total === 1 ? '' : 's'}) [${label}]`,
+      {
+        targetsCount: started.job.total,
+        targetsSample: started.job.targets.slice(0, 5),
+        increments: {jobsStarted: 1},
+      },
+    );
 
     res.status(201).json({
       ok: true,
@@ -228,6 +375,13 @@ async function startServer(): Promise<void> {
       return;
     }
     const job = jobManager.pauseJob(req.params.jobId);
+    if (job) {
+      recordWebActivity(
+        identity,
+        'lookup_paused',
+        `Paused job ${job.id.slice(0, 8)} at ${job.currentIndex}/${job.total}`,
+      );
+    }
     res.json({ok: true, job: job ? sanitizeJobForClient(job) : null});
   });
 
@@ -239,6 +393,13 @@ async function startServer(): Promise<void> {
       return;
     }
     const job = jobManager.resumeJob(req.params.jobId);
+    if (job) {
+      recordWebActivity(
+        identity,
+        'lookup_resumed',
+        `Resumed job ${job.id.slice(0, 8)} at ${job.currentIndex}/${job.total}`,
+      );
+    }
     res.json({ok: true, job: job ? sanitizeJobForClient(job) : null});
   });
 
@@ -250,6 +411,13 @@ async function startServer(): Promise<void> {
       return;
     }
     const job = await jobManager.stopJob(req.params.jobId);
+    if (job) {
+      recordWebActivity(
+        identity,
+        'lookup_stopped',
+        `Stopped job ${job.id.slice(0, 8)} at ${job.currentIndex}/${job.total}`,
+      );
+    }
     res.json({
       ok: true,
       job: job ? sanitizeJobForClient(job) : null,
@@ -321,6 +489,12 @@ async function startServer(): Promise<void> {
       const isCsv = req.params.filename.endsWith('.csv');
 
       if (isDownload) {
+        recordWebActivity(
+          identity,
+          'export_downloaded',
+          `Downloaded ${req.params.filename}`,
+          {increments: {exportsDownloaded: 1}},
+        );
         res.setHeader('Content-Disposition', `attachment; filename="${req.params.filename}"`);
         res.setHeader(
           'Content-Type',
@@ -351,10 +525,61 @@ async function startServer(): Promise<void> {
 
     try {
       await fs.unlink(resolved);
+      recordWebActivity(identity, 'export_deleted', `Deleted export ${req.params.filename}`);
       res.json({ok: true});
     } catch {
       res.status(404).json({ok: false, error: 'Export file not found.'});
     }
+  });
+
+  app.get('/api/admin/activity', (req, res) => {
+    const identity = res.locals.identity as VerifiedIdentity;
+    if (!isVerifiedAdmin(identity)) {
+      recordWebActivity(
+        identity,
+        'unauthorized_access',
+        'Attempted access to /api/admin/activity',
+        {increments: {blocked: 1}},
+      );
+      res.status(403).json({ok: false, error: 'Admin access required.'});
+      return;
+    }
+    const limit = Number(req.query.limit ?? 150) || 150;
+    const summary = activityTracker.getSummary(quotaManager, limit);
+    res.json({ok: true, ...summary});
+  });
+
+  app.get('/api/admin/activity/export', (req, res) => {
+    const identity = res.locals.identity as VerifiedIdentity;
+    if (!isVerifiedAdmin(identity)) {
+      recordWebActivity(
+        identity,
+        'unauthorized_access',
+        'Attempted access to /api/admin/activity/export',
+        {increments: {blocked: 1}},
+      );
+      res.status(403).json({ok: false, error: 'Admin access required.'});
+      return;
+    }
+
+    const format = req.query.format === 'json' ? 'json' : 'csv';
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '_').slice(0, 15);
+    if (format === 'json') {
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="activity_report_${stamp}.json"`,
+      );
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.send(activityTracker.buildExportJson(quotaManager));
+      return;
+    }
+
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="activity_report_${stamp}.csv"`,
+    );
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.send(activityTracker.buildExportCsv(quotaManager));
   });
 
   if (process.env.NODE_ENV !== 'production') {

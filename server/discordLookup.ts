@@ -660,12 +660,25 @@ export class LookupJobManager {
   private readonly jobs = new Map<string, LookupJob>();
   private readonly activeOwners = new Set<string>();
   private readonly activeTokens = new Set<string>();
+  private readonly notifiedFinishedJobs = new Set<string>();
   private readonly exportsDir: string;
   private readonly quotaManager: QuotaManager;
+  private readonly onJobFinished?: (job: LookupJob) => void;
 
-  constructor(exportsDir: string, quotaManager: QuotaManager) {
+  constructor(
+    exportsDir: string,
+    quotaManager: QuotaManager,
+    options?: {onJobFinished?: (job: LookupJob) => void},
+  ) {
     this.exportsDir = exportsDir;
     this.quotaManager = quotaManager;
+    this.onJobFinished = options?.onJobFinished;
+  }
+
+  private notifyJobFinished(job: LookupJob): void {
+    if (this.notifiedFinishedJobs.has(job.id)) return;
+    this.notifiedFinishedJobs.add(job.id);
+    this.onJobFinished?.(job);
   }
 
   async init(): Promise<void> {
@@ -852,12 +865,14 @@ export class LookupJobManager {
       if (job.results.length > 0) {
         await this.persistExportFiles(job);
       }
+      this.notifyJobFinished(job);
     } catch {
       job.status = 'failed';
       job.finishedAt = new Date().toISOString();
       if (job.results.length > 0) {
         await this.persistExportFiles(job);
       }
+      this.notifyJobFinished(job);
     } finally {
       this.activeOwners.delete(job.ownerKey);
       this.activeTokens.delete(tokenDigest);

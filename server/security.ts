@@ -7,6 +7,8 @@ export interface VerifiedIdentity {
   ownerHash: string;
   source: 'telegram_webapp' | 'ip';
   telegramUserId?: number;
+  telegramUsername?: string;
+  telegramFirstName?: string;
 }
 
 export interface RejectedIdentity {
@@ -40,7 +42,9 @@ export function verifyTelegramInitData(
   initDataRaw: string,
   botToken: string,
   maxAgeSeconds = 86400,
-): {ok: true; userId: number; username?: string} | {ok: false; error: string} {
+):
+  | {ok: true; userId: number; username?: string; firstName?: string}
+  | {ok: false; error: string} {
   if (!initDataRaw || !botToken) {
     return {ok: false, error: 'Missing Telegram initData or bot token.'};
   }
@@ -89,7 +93,11 @@ export function verifyTelegramInitData(
     if (!userRaw) {
       return {ok: false, error: 'Telegram user payload missing.'};
     }
-    const parsedUser = JSON.parse(userRaw) as {id?: unknown; username?: unknown};
+    const parsedUser = JSON.parse(userRaw) as {
+      id?: unknown;
+      username?: unknown;
+      first_name?: unknown;
+    };
     const userId = Number(parsedUser.id);
     if (!Number.isInteger(userId) || userId <= 0) {
       return {ok: false, error: 'Invalid Telegram user ID.'};
@@ -99,6 +107,7 @@ export function verifyTelegramInitData(
       ok: true,
       userId,
       username: typeof parsedUser.username === 'string' ? parsedUser.username : undefined,
+      firstName: typeof parsedUser.first_name === 'string' ? parsedUser.first_name : undefined,
     };
   } catch {
     return {ok: false, error: 'Failed to validate Telegram initData.'};
@@ -125,6 +134,8 @@ export function resolveRequestIdentity(
       ownerHash: hashOwnerKey(ownerKey),
       source: 'telegram_webapp',
       telegramUserId: verified.userId,
+      telegramUsername: verified.username,
+      telegramFirstName: verified.firstName,
     };
   }
 

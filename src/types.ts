@@ -89,3 +89,50 @@ export interface ExportFileMeta {
   recordCount: number;
   createdAt: string;
 }
+
+export interface TrackedUserSummary {
+  ownerKey: string;
+  ownerHash: string;
+  channel: 'telegram_bot' | 'telegram_webapp' | 'web';
+  telegramUserId?: number;
+  telegramUsername?: string;
+  firstName?: string;
+  discordAccountId?: string;
+  discordUsername?: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  lastAction: string;
+  lastDetails: string;
+  totalActions: number;
+  totalJobsStarted: number;
+  totalLookupsProcessed: number;
+  totalLookupsResolved: number;
+  totalLookupsFailed: number;
+  totalExportsDownloaded: number;
+  blockedCount: number;
+  quota: QuotaSnapshot;
+}
+
+export interface ActivityEventEntry {
+  id: string;
+  timestamp: string;
+  ownerKey: string;
+  ownerHash: string;
+  channel: 'telegram_bot' | 'telegram_webapp' | 'web';
+  telegramUserId?: number;
+  telegramUsername?: string;
+  firstName?: string;
+  action: string;
+  details: string;
+  targetsCount?: number;
+  targetsSample?: string[];
+}
+
+export interface AdminActivitySummary {
+  totalUsers: number;
+  activeToday: number;
+  totalEvents: number;
+  users: TrackedUserSummary[];
+  events: ActivityEventEntry[];
+}
+

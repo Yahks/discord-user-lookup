@@ -37,3 +37,18 @@ export async function downloadExportFile(filename: string): Promise<void> {
   link.remove();
   URL.revokeObjectURL(url);
 }
+
+export async function downloadAdminActivityReport(format: 'csv' | 'json'): Promise<void> {
+  const resp = await apiFetch(`/api/admin/activity/export?format=${format}`);
+  if (!resp.ok) return;
+  const blob = await resp.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `activity_report.${format}`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
