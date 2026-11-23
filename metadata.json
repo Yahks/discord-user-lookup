@@ -1,0 +1,6 @@
+{
+  "name": "Discord Username Lookup Script",
+  "description": "Standalone Python Discord username and profile lookup utility using captured Discord API v9 endpoints.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
